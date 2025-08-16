@@ -25,7 +25,7 @@ public class ClientTests {
       // "aeron:udp?endpoint=localhost:40123"
 
       // Prepare a direct buffer to write the message into
-      UnsafeBuffer buffer = new UnsafeBuffer(ByteBuffer.allocateDirect(256));
+      UnsafeBuffer buffer = new UnsafeBuffer(ByteBuffer.allocateDirect(4096));
 
       // Create and wrap the header and message encoder
       MessageHeaderEncoder headerEncoder = new MessageHeaderEncoder();
@@ -42,16 +42,32 @@ public class ClientTests {
           .orderQty(100)
           .orderType(OrderType.Limit);
       orderEncoder.price().exponent((byte) 5).mantissa(22345);
-
       int length = MessageHeaderEncoder.ENCODED_LENGTH + orderEncoder.encodedLength();
 
       // Send the message over Aeron
       LOG.info("Publishing to: " + publication.toString());
       long result = publication.offer(buffer, offset, length);
+
       if (result < 0) {
-        System.err.println("Offer failed: " + result);
+        if (result == Publication.BACK_PRESSURED) {
+          System.out.println("Back pressured");
+        } else if (result == Publication.NOT_CONNECTED) {
+          System.out.println("Not connected");
+        } else if (result == Publication.ADMIN_ACTION) {
+          System.out.println("Admin action");
+        } else {
+          System.out.println("Unknown error " + result);
+        }
+      } else {
+        System.out.println("Message sent at position " + result);
       }
+
       Subscription subscription = aeron.addSubscription("aeron:ipc", 10);
+      try {
+        Thread.sleep(10000);
+      } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+      }
       processMessage(subscription);
     }
   }
@@ -70,10 +86,10 @@ public class ClientTests {
                   ExecutionReportDecoder executionReportDecoder = new ExecutionReportDecoder();
                   executionReportDecoder.wrap(
                           buffer,
-                          offset + MessageHeaderDecoder.ENCODED_LENGTH,
+                          offset,
                           headerDecoder.blockLength(),
                           headerDecoder.version());
-                  System.out.println(executionReportDecoder.senderCompID());
+                  LOG.info("Exec Report: " + executionReportDecoder.toString());
                   break;
                 default:
                   LOG.error("Unknown message with templateId: " + templateId);

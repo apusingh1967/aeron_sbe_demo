@@ -137,13 +137,13 @@ public class Main {
 
   private void processNewOrderSingle(
       DirectBuffer buffer, int offset, MessageHeaderDecoder headerDecoder) {
-    // Decode message
-    NewOrderSingleDecoder orderDecoder = new NewOrderSingleDecoder();
-    orderDecoder.wrap(
-        buffer,
-        offset + MessageHeaderDecoder.ENCODED_LENGTH,
-        headerDecoder.blockLength(),
-        headerDecoder.version());
+      int actingBlockLength = headerDecoder.blockLength();
+      int schemaVersion = headerDecoder.version();
+
+// Wrap the message decoder at the correct offset
+      NewOrderSingleDecoder orderDecoder = new NewOrderSingleDecoder();
+      orderDecoder.wrap(buffer, offset,
+              actingBlockLength, schemaVersion);
 
     var senderCompID = orderDecoder.senderCompID();
     long clOrdID = orderDecoder.clOrdID();
@@ -153,6 +153,7 @@ public class Main {
             : Side.SELL;
     int qty = orderDecoder.orderQty();
     PriceDecoder price = orderDecoder.price();
+      System.out.println(qty + ", " + price.toString());
     long timestamp = orderDecoder.timestamp();
     if (orderDecoder.orderType().equals(OrderType.Limit)) {
 
