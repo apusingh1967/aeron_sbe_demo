@@ -10,10 +10,14 @@ import io.aeron.driver.MediaDriver;
 import io.aeron.logbuffer.FragmentHandler;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.agrona.DirectBuffer;
+import org.agrona.concurrent.BackoffIdleStrategy;
+import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,45 +32,61 @@ public class Main {
   // but we are going single thread per shard
   private final List<Subscription> subscriptions = new ArrayList<>();
   private final Map<String, Publication> publications = new HashMap<>();
-  private final UnsafeBuffer encodeBuffer = new UnsafeBuffer(new byte[4096]);
+  private final UnsafeBuffer buffer = new UnsafeBuffer(ByteBuffer.allocateDirect(4096));
+
+  private final MessageHeaderEncoder messageHeaderEncoder = new MessageHeaderEncoder();
+  private final MessageHeaderDecoder messageHeaderDecoder = new MessageHeaderDecoder();
   private final NewOrderSingleDecoder newOrderSingleDecoder = new NewOrderSingleDecoder();
   private final OrderCancelReplaceRequestDecoder orderCancelReplaceRequestDecoder =
       new OrderCancelReplaceRequestDecoder();
   private final OrderCancelRequestDecoder orderCancelRequestDecoder =
       new OrderCancelRequestDecoder();
-  private final ExecutionReportEncoder execEncoder = new ExecutionReportEncoder();
+  private final ExecutionReportEncoder executionReportEncoder = new ExecutionReportEncoder();
+
+  // This uses BackoffIdleStrategy, which is a progressive idle strategy that escalates from busy
+  // spinning → yielding → parking (sleeping).
+  // The constructor parameters mean:
+  // spins = 100
+  //   First, the thread will busy-spin in a loop for up to 100 iterations (fastest, lowest latency,
+  // but burns CPU).
+  // yields = 10
+  //   If still idle, the thread will call Thread.yield() up to 10 times (lets the OS scheduler run
+  // other threads).
+  // minParkPeriodNs = 1 microsecond
+  //   After spins and yields, the thread will LockSupport.parkNanos() for a small time (here: 1
+  // µs).
+  // maxParkPeriodNs = 1 millisecond
+  //   If it remains idle for longer, the park time backs off exponentially up to 1 ms max.
+  private final IdleStrategy idleStrategy =
+      new BackoffIdleStrategy(
+          100, 10, TimeUnit.MICROSECONDS.toNanos(1), TimeUnit.MILLISECONDS.toNanos(1));
 
   public static void main(String[] args) {
-    MediaDriver.Context context =
-        new MediaDriver.Context()
-            .aeronDirectoryName("/tmp/aeron") // 👈 Set custom directory
-            .dirDeleteOnStart(true); // Optional: clean dir on start
     latch = new CountDownLatch(1); // only one thread so far
 
-   // try (MediaDriver ignore = MediaDriver.launchEmbedded(context)) {
-      for (int i = 0; i < 1; i++) {
-        final int core = i;
-        new Thread(
-                () -> {
-                  // CPU affinity with core. In hyperthreading, will try to affinity one thread per
-                  // core
-                  // and when all used, then move to use hyperthreaded twin
-                  // does not work on ARM, uncomment on x64 for thread affinity
+    // try (MediaDriver ignore = MediaDriver.launchEmbedded(context)) {
+    for (int i = 0; i < 1; i++) {
+      final int core = i;
+      new Thread(
+              () -> {
+                // CPU affinity with core. In hyperthreading, will try to affinity one thread per
+                // core
+                // and when all used, then move to use hyperthreaded twin
+                // does not work on ARM, uncomment on x64 for thread affinity
 
-                  // try (AffinityLock lock = AffinityLock.acquireLock(core)) {
-                  new Main(
-                      "com/codingmonster/common/engine-shard-" + core + "-channels.properties");
-                  //  }
-                })
-            .start();
-      }
+                // try (AffinityLock lock = AffinityLock.acquireLock(core)) {
+                new Main("com/codingmonster/common/engine-shard-" + core + "-channels.properties");
+                //  }
+              })
+          .start();
+    }
 
-      try {
-        latch.await();
-      } catch (InterruptedException e) {
-        throw new RuntimeException(e);
-      }
-  //  }
+    try {
+      latch.await();
+    } catch (InterruptedException e) {
+      throw new RuntimeException(e);
+    }
+    //  }
   }
 
   public Main(String path) {
@@ -100,99 +120,135 @@ public class Main {
             LOG.info(String.format("Matching Engine Instance Ready for: %s %s", path, trader));
           });
 
+      runEventLoop();
+    }
+  }
+
+  private void runEventLoop() {
     while (started.get()) {
       FragmentHandler handler =
-              (buffer, offset, length, header) -> {
-                // Decode header
-                MessageHeaderDecoder headerDecoder = new MessageHeaderDecoder();
-                headerDecoder.wrap(buffer, offset); // will read only header from buffer
-                offset += MessageHeaderDecoder.ENCODED_LENGTH;
+          (buffer, offset, length, header) -> {
+            messageHeaderDecoder.wrap(buffer, offset);
+            offset += MessageHeaderDecoder.ENCODED_LENGTH;
 
-                int templateId = headerDecoder.templateId();
-                switch (templateId) {
-                  case NewOrderSingleDecoder.TEMPLATE_ID:
-                    processNewOrderSingle(buffer, offset, headerDecoder);
-                    break;
-                  case OrderCancelReplaceRequestDecoder.TEMPLATE_ID:
-                    break;
-                  case OrderCancelRequestDecoder.TEMPLATE_ID:
-                    break;
-                  case StopSessionDecoder.TEMPLATE_ID:
-                    this.started.set(false);
-                    break;
-                  default:
-                    LOG.error("Unknown message with templateId: " + templateId);
-                }
-              };
+            int templateId = messageHeaderDecoder.templateId();
+            switch (templateId) {
+              case NewOrderSingleDecoder.TEMPLATE_ID:
+                processNewOrderSingle(buffer, offset, messageHeaderDecoder);
+                break;
+              case OrderCancelReplaceRequestDecoder.TEMPLATE_ID:
+                break;
+              case OrderCancelRequestDecoder.TEMPLATE_ID:
+                break;
+              case StopSessionDecoder.TEMPLATE_ID:
+                this.started.set(false);
+                break;
+              default:
+                LOG.error("Unknown message with templateId: " + templateId);
+            }
+          };
 
       // Poll from the subscription
       for (Subscription subscription : subscriptions) {
-        int ignore = subscription.poll(handler, 1);
+        int result;
+        do {
+          result = subscription.poll(handler, 1);
+          if (result < 0) {
+            if (result == Publication.BACK_PRESSURED) {
+              idleStrategy.idle();
+            } else if (result == Publication.NOT_CONNECTED) {
+              idleStrategy.idle();
+            } else if (result == Publication.ADMIN_ACTION) {
+              idleStrategy.idle();
+            } else {
+              LOG.warn("Unknown error " + result);
+            }
+          }
+        } while (result <= 0);
       }
     }
-      // Thread.yield();
-    }
-   // latch.countDown();
   }
 
   private void processNewOrderSingle(
       DirectBuffer buffer, int offset, MessageHeaderDecoder headerDecoder) {
-    // Decode message
-    NewOrderSingleDecoder orderDecoder = new NewOrderSingleDecoder();
-    orderDecoder.wrap(
-        buffer,
-        offset + MessageHeaderDecoder.ENCODED_LENGTH,
-        headerDecoder.blockLength(),
-        headerDecoder.version());
+    int actingBlockLength = headerDecoder.blockLength();
+    int schemaVersion = headerDecoder.version();
 
-    var senderCompID = orderDecoder.senderCompID();
-    long clOrdID = orderDecoder.clOrdID();
+    // Wrap the message decoder at the correct offset
+    newOrderSingleDecoder.wrap(buffer, offset, actingBlockLength, schemaVersion);
+
+    var senderCompID = newOrderSingleDecoder.senderCompID();
+    long clOrdID = newOrderSingleDecoder.clOrdID();
     Side side =
-        orderDecoder.side().equals(com.codingmonster.common.sbe.trade.Side.Buy)
+        newOrderSingleDecoder.side().equals(com.codingmonster.common.sbe.trade.Side.Buy)
             ? Side.BUY
             : Side.SELL;
-    int qty = orderDecoder.orderQty();
-    PriceDecoder price = orderDecoder.price();
-    long timestamp = orderDecoder.timestamp();
-    if (orderDecoder.orderType().equals(OrderType.Limit)) {
+    int qty = newOrderSingleDecoder.orderQty();
+    PriceDecoder price = newOrderSingleDecoder.price();
+    long timestamp = newOrderSingleDecoder.timestamp();
+    LOG.info(
+            "Received order: sender={}, ID={}, Side={}, Qty={}, Price={}, TS: {}",
+            senderCompID,
+            clOrdID,
+            side,
+            qty,
+            price,
+            timestamp);
 
-    } else if (orderDecoder.orderType().equals(OrderType.Market)) {
+    if (newOrderSingleDecoder.orderType().equals(OrderType.Limit)) {
+
+    } else if (newOrderSingleDecoder.orderType().equals(OrderType.Market)) {
 
     } else {
-
+      LOG.warn("Order type not supported: " + newOrderSingleDecoder.orderType());
     }
 
-    System.out.printf(
-        "Received order: sender=%s, ID=%d, Side=%s, Qty=%d, Price=%s, TS: %d %n",
-            senderCompID, clOrdID, side, qty, price.toString(), timestamp);
+    sendExecutionReport(senderCompID);
+  }
 
+  private void sendExecutionReport(String senderCompID) {
+    int offset;
     // 1. Wrap a buffer at offset 0 for header + message
     offset = 0;
-
-// 2. Encode the SBE Message Header first
-    MessageHeaderEncoder messageHeaderEncoder = new MessageHeaderEncoder();
-    ExecutionReportEncoder executionReportEncoder = new ExecutionReportEncoder();
-
     // 3. Encode your ExecutionReport payload right after header
+    messageHeaderEncoder
+            .wrap(buffer, offset)
+            .blockLength(executionReportEncoder.sbeBlockLength())
+            .templateId(executionReportEncoder.sbeTemplateId())
+            .schemaId(executionReportEncoder.sbeSchemaId())
+            .version(executionReportEncoder.sbeSchemaVersion());
+    offset += messageHeaderDecoder.encodedLength();
+
     executionReportEncoder
-            .wrapAndApplyHeader(this.encodeBuffer, offset, messageHeaderEncoder)
-            .clOrdID(121)
-            .execType(ExecType.Fill)
-            .ordStatus(OrdStatus.Filled)
-            .filledQty(12)
-            .leavesQty(8);
+        .clOrdID(121)
+        .execType(ExecType.Fill)
+        .ordStatus(OrdStatus.Filled)
+        .filledQty(12)
+        .leavesQty(8);
+    executionReportEncoder.senderCompID().appendTo(new StringBuilder("exchange"));
+    executionReportEncoder.price().exponent((byte) 3).mantissa(12345);
 
-    executionReportEncoder.price()
-            .exponent((byte) 3)
-            .mantissa(12345);
-
-// 4. Calculate total length = header + payload
-    int length =
-            messageHeaderEncoder.encodedLength() +
-                    executionReportEncoder.encodedLength();
+    // 4. Calculate total length = header + payload
+    int length = messageHeaderEncoder.encodedLength() + executionReportEncoder.encodedLength();
 
     Publication publication = publications.get(senderCompID);
-// 5. Send via Aeron
-    long ignore = publication.offer(this.encodeBuffer, offset, length);
+    // 5. Send via Aeron
+    long result;
+    do {
+      result = publication.offer(this.buffer, offset, length);
+      if (result < 0) {
+        if (result == Publication.BACK_PRESSURED) {
+          System.out.println("Back pressured");
+        } else if (result == Publication.NOT_CONNECTED) {
+          System.out.println("Not connected");
+        } else if (result == Publication.ADMIN_ACTION) {
+          System.out.println("Admin action");
+        } else {
+          System.out.println("Unknown error " + result);
+        }
+      } else {
+        System.out.println("Message sent at position " + result);
+      }
+    } while(result <= 0);
   }
 }
